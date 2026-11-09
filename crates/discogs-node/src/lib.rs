@@ -153,6 +153,7 @@ pub fn profile_artists(options: ProfileArtistsOptions) -> Result<AsyncTask<Profi
             block_size: options.block_size.unwrap_or(0) as usize,
             checksum: options.checksum,
             kind,
+            no_hash: false,
         },
     }))
 }

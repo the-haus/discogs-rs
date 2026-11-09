@@ -76,4 +76,8 @@ function loadNative() {
   );
 }
 
-module.exports = loadNative();
+const native = loadNative();
+
+// Named one by one, so that ESM `import { profileArtists }` finds them.
+module.exports.profileArtists = native.profileArtists;
+module.exports.version = native.version;
