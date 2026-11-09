@@ -1,0 +1,7 @@
+# Discogs artist ids for the fixtures
+1
+2
+3
+4
+7
+239

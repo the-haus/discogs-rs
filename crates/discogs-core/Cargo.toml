@@ -1,0 +1,28 @@
+[package]
+name = "discogs-core"
+edition.workspace = true
+version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "discogs-rs — read the Discogs monthly data dumps fast: gzip, block splitting, parallel byte scanners and per-artist genre/style profiles."
+keywords = ["discogs", "dump", "xml", "music", "parallel"]
+categories = ["parser-implementations", "multimedia::audio"]
+
+[dependencies]
+crossbeam-channel.workspace = true
+memchr.workspace = true
+rustc-hash.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+parquet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+flate2.workspace = true
