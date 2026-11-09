@@ -1,0 +1,47 @@
+[workspace]
+members = [
+    "crates/discogs-core",
+    "crates/discogs-cli",
+    "crates/discogs-node",
+]
+exclude = ["fuzz"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license-file = "LICENCE.txt"
+repository = "https://github.com/the-haus/discogs-rs"
+rust-version = "1.87"
+
+[workspace.dependencies]
+# Internal crates.
+discogs-core = { path = "crates/discogs-core", version = "=0.1.0" }
+
+# External crates.
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+memchr = "2.7"
+rustc-hash = "2"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+sha2 = "0.10"
+arrow-array = { version = "57", default-features = false }
+arrow-schema = { version = "57", default-features = false }
+parquet = { version = "57", default-features = false, features = ["arrow", "zstd"] }
+mimalloc = { version = "0.1", default-features = false }
+clap = { version = "4", features = ["derive"] }
+proptest = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = 1
+panic = "unwind"
+
+# The benches and the property tests run the scanner over megabytes: keep
+# the test profile optimised enough that they finish in seconds.
+[profile.test]
+opt-level = 2
