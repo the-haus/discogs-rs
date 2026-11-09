@@ -27,7 +27,9 @@ crossbeam-channel = "0.5"
 memchr = "2.7"
 rustc-hash = "2"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-sha2 = "0.10"
+# `asm`: ARMv8 SHA instructions on aarch64 (5× the portable code: 1.9 GB/s
+# vs 0.35 GB/s on an M1); x86_64 uses SHA-NI when the CPU has it either way.
+sha2 = { version = "0.10", features = ["asm"] }
 arrow-array = { version = "57", default-features = false }
 arrow-schema = { version = "57", default-features = false }
 parquet = { version = "57", default-features = false, features = ["arrow", "zstd"] }

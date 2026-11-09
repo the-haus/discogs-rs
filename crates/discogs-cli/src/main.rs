@@ -47,6 +47,9 @@ enum Command {
         /// Output: .parquet or .jsonl.
         #[arg(long)]
         out: PathBuf,
+        /// Skip the SHA-256 of the input (ignored with --checksum).
+        #[arg(long)]
+        no_hash: bool,
         /// Print the summary as JSON on stdout.
         #[arg(long)]
         json: bool,
@@ -84,6 +87,7 @@ fn main() -> Result<()> {
             kind,
             block_mb,
             out,
+            no_hash,
             json,
         } => {
             let text = std::fs::read(&targets).with_context(|| format!("{}", targets.display()))?;
@@ -93,6 +97,7 @@ fn main() -> Result<()> {
                 block_size: block_mb << 20,
                 checksum,
                 kind,
+                no_hash,
             };
             let profile = profile_path(&input, &targets, &options)?;
             let t = Instant::now();
@@ -236,17 +241,17 @@ fn bench(gb: f64, dir: &Path, hit_rates: &[f64], threads: usize, kind: RecordKin
 
     for &rate in hit_rates {
         let targets = TargetSet::from_ids(targets_for_hit_rate(rate, options.max_artist_id));
-        for (label, input) in [("scan (plain xml)", &xml), ("end to end (gzip)", &gz)] {
+        // Split + scan on XML already decompressed (from the page cache, no
+        // sha256), then the whole pipeline on the gzip file, sha256 included.
+        for (label, input, no_hash) in [("split+scan (xml)", &xml, true), ("end to end (gzip)", &gz, false)] {
             for t in [1, many] {
-                let profile = profile_path(
-                    input,
-                    &targets,
-                    &ProfileOptions {
-                        threads: t,
-                        kind: Some(kind),
-                        ..Default::default()
-                    },
-                )?;
+                let options = ProfileOptions {
+                    threads: t,
+                    kind: Some(kind),
+                    no_hash,
+                    ..Default::default()
+                };
+                let profile = profile_path(input, &targets, &options)?;
                 let s = &profile.summary;
                 let hit = s.hits as f64 / s.records.max(1) as f64;
                 eprintln!(

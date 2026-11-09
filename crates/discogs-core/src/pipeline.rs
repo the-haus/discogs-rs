@@ -37,6 +37,9 @@ pub struct ProfileOptions {
     pub checksum: Option<String>,
     /// The dump's kind; `None` reads it from the root element.
     pub kind: Option<RecordKind>,
+    /// Skip the SHA-256 (the summary's `sha256` is then empty). Ignored
+    /// when `checksum` is set. For benchmarks of the later stages.
+    pub no_hash: bool,
 }
 
 impl ProfileOptions {
@@ -83,7 +86,7 @@ pub struct Summary {
     pub bytes_decompressed: u64,
     /// Output rows.
     pub rows: u64,
-    /// The input's SHA-256, lowercase hex.
+    /// The input's SHA-256, lowercase hex (empty with `no_hash`).
     pub sha256: String,
     /// `zlib-rs` for gzip input, `none` for plain XML.
     pub decompressor: String,
@@ -176,7 +179,8 @@ pub fn profile_reader<R: Read + Send>(input: R, targets: &TargetSet, options: &P
     let (read_stats, split_stats, scanned) = std::thread::scope(|s| {
         let failure = &failure;
         let kind_cell = &kind_cell;
-        let reader = s.spawn(move || read_and_hash(input, chunk_tx, chunk_back_rx, failure));
+        let hash = expected.is_some() || !options.no_hash;
+        let reader = s.spawn(move || read_and_hash(input, hash, chunk_tx, chunk_back_rx, failure));
         let splitter = s.spawn(move || {
             decompress_and_split(
                 chunk_rx,
@@ -268,7 +272,13 @@ pub fn profile_reader<R: Read + Send>(input: R, targets: &TargetSet, options: &P
 }
 
 /// The reader thread: chunks of the input, hashed on the way.
-fn read_and_hash<R: Read>(mut input: R, tx: Sender<Vec<u8>>, back: Receiver<Vec<u8>>, failure: &Failure) -> ReadStats {
+fn read_and_hash<R: Read>(
+    mut input: R,
+    hash: bool,
+    tx: Sender<Vec<u8>>,
+    back: Receiver<Vec<u8>>,
+    failure: &Failure,
+) -> ReadStats {
     let mut hasher = Sha256::new();
     let mut stats = ReadStats {
         bytes: 0,
@@ -295,14 +305,18 @@ fn read_and_hash<R: Read>(mut input: R, tx: Sender<Vec<u8>>, back: Receiver<Vec<
             break;
         }
         stats.bytes += got as u64;
-        let t = Instant::now();
-        hasher.update(&chunk);
-        stats.hash += t.elapsed();
+        if hash {
+            let t = Instant::now();
+            hasher.update(&chunk);
+            stats.hash += t.elapsed();
+        }
         if tx.send(chunk).is_err() {
             break;
         }
     }
-    stats.sha256 = hex(&hasher.finalize());
+    if hash {
+        stats.sha256 = hex(&hasher.finalize());
+    }
     stats
 }
 
