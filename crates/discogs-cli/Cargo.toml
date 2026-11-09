@@ -1,0 +1,27 @@
+[package]
+name = "discogs-cli"
+edition.workspace = true
+version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "discogs-rs — the `discogs` command: per-artist genre and style profiles from the Discogs data dumps, fast."
+keywords = ["discogs", "dump", "cli", "music", "parquet"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "discogs"
+path = "src/main.rs"
+
+[features]
+default = ["mimalloc"]
+# mimalloc as the global allocator.
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+discogs-core.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+flate2.workspace = true
+mimalloc = { workspace = true, optional = true }
