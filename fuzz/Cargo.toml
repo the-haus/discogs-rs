@@ -1,0 +1,22 @@
+[package]
+name = "discogs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+discogs-core = { path = "../crates/discogs-core" }
+
+[[bin]]
+name = "scan"
+path = "fuzz_targets/scan.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the main workspace: cargo-fuzz builds it on nightly.
+[workspace]

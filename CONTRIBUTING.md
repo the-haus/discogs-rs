@@ -17,7 +17,9 @@ corepack yarn install && cd crates/discogs-node && corepack yarn build && corepa
   comment, with an example (e.g. why `<master_id>0</master_id>` is no
   master).
 - Changes to the scanner or splitter: run the fuzzer for a few minutes
-  (`cargo +nightly fuzz run scan -- -dict=fuzz/discogs.dict`).
+  (`cargo +nightly fuzz run scan -- -dict=fuzz/discogs.dict`; on macOS
+  add `--sanitizer none`: AddressSanitizer's start-up hangs there in
+  `InitializeShadowMemory`, before the target runs).
 - Commits follow Conventional Commits (`feat:`, `fix:`, `perf:`, …).
 
 ## Releasing

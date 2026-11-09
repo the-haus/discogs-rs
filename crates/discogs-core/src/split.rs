@@ -48,6 +48,8 @@ impl<R: Read> Splitter<R> {
         buf.clear();
         buf.append(&mut self.carry);
         let mut want = self.block_size;
+        // Bytes of `buf` already known to hold no end tag.
+        let mut searched: usize = 0;
         loop {
             while buf.len() < want && !self.eof {
                 let need = (want - buf.len()) as u64;
@@ -60,13 +62,20 @@ impl<R: Read> Splitter<R> {
             if self.eof {
                 return Ok((!buf.is_empty()).then_some(buf));
             }
-            if let Some(p) = self.close.rfind(&buf) {
-                let cut = p + self.close.needle().len();
+            // Only the new bytes (and a tag's length before them) can hold
+            // an end tag not searched yet.
+            let from = searched.saturating_sub(self.close.needle().len() - 1);
+            if let Some(p) = self.close.rfind(&buf[from..]) {
+                let cut = from + p + self.close.needle().len();
                 self.carry.extend_from_slice(&buf[cut..]);
                 buf.truncate(cut);
                 return Ok(Some(buf));
             }
-            want += self.block_size;
+            searched = buf.len();
+            // No end tag yet (a record bigger than a block, or no records at
+            // all): grow geometrically, so a long run without one costs
+            // linear time, not quadratic.
+            want += self.block_size.max(buf.len());
         }
     }
 }
@@ -97,5 +106,19 @@ mod tests {
         }
         assert_eq!(blocks(b"", 4).len(), 0);
         assert_eq!(blocks(b"no tags at all", 4), vec![b"no tags at all".to_vec()]);
+    }
+
+    #[test]
+    fn long_runs_without_a_tag_stay_linear() {
+        // 8 MB with one tag at the end, at block size 1: quadratic growth
+        // would take minutes.
+        let mut input = vec![b'x'; 8 << 20];
+        input.extend_from_slice(b"</r>tail");
+        let t = std::time::Instant::now();
+        input.extend(std::iter::repeat_n(b'y', 32 << 20));
+        let b = blocks(&input, 1);
+        assert_eq!(b.concat(), input);
+        assert!(b[0].ends_with(b"</r>"), "the first block ends at the tag");
+        assert!(t.elapsed().as_secs() < 5);
     }
 }

@@ -227,7 +227,7 @@ threads change nothing end to end; they matter only for plain XML input.
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --exclude discogs-node
 corepack yarn install && cd crates/discogs-node && corepack yarn build && corepack yarn test
-cargo +nightly fuzz run scan -- -dict=fuzz/discogs.dict   # needs cargo-fuzz
+cargo +nightly fuzz run scan -- -dict=fuzz/discogs.dict   # needs cargo-fuzz; macOS: add --sanitizer none
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
