@@ -1,0 +1,154 @@
+# Release everything for a v* tag (or a dry run by hand):
+#
+# 1. check: versions agree with the tag (scripts/check-version.mjs), the
+#    workspace builds and its tests pass, and the CHANGELOG section becomes
+#    the release notes;
+# 2. npm: @discogs-rs/node and its three platform packages (release-node.yml);
+# 3. cli: `discogs` binaries for Linux (x64, arm64) and macOS (arm64);
+# 4. github-release: a GitHub release with the notes, binaries and checksums.
+#
+# The crates are not published to crates.io yet.
+#
+# Secrets: NPM_TOKEN (or npm trusted publishing).
+# Environments: npm-publish (add reviewers to gate it).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Build and check everything but publish nothing.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
+
+jobs:
+  check:
+    name: check versions, build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-node-yarn
+      - id: version
+        name: versions agree (with the tag)
+        shell: bash
+        run: |
+          TAG=""
+          [[ "$GITHUB_REF" == refs/tags/v* ]] && TAG="$GITHUB_REF_NAME"
+          echo "version=$(node scripts/check-version.mjs ${TAG:+"$TAG"})" >> "$GITHUB_OUTPUT"
+      - name: release notes from CHANGELOG.md
+        shell: bash
+        env:
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          awk -v v="$V" '$0 ~ "^## "v"( |$)" {on=1; next} on && /^## / {exit} on' CHANGELOG.md > notes.md
+          test -s notes.md
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-notes
+          path: notes.md
+          retention-days: 1
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release-check
+          components: rustfmt,clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked --release --exclude discogs-node
+
+  npm:
+    needs: check
+    uses: ./.github/workflows/release-node.yml
+    with:
+      dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    permissions:
+      contents: read
+      id-token: write
+
+  cli:
+    name: discogs ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release-cli-${{ matrix.target }}
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked -p discogs-cli --target ${{ matrix.target }}
+      - name: smoke test
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          "target/$TARGET/release/discogs" --version
+          "target/$TARGET/release/discogs" profile --input fixtures/releases.xml --targets fixtures/targets.txt --out /tmp/smoke.parquet
+      - name: package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          NAME="discogs-$VERSION-$TARGET"
+          mkdir -p "dist/$NAME"
+          cp "target/$TARGET/release/discogs" README.md CHANGELOG.md LICENCE.txt "dist/$NAME/"
+          cd dist && tar -czf "$NAME.tar.gz" "$NAME" && rm -rf "$NAME"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  github-release:
+    name: GitHub release
+    needs: [check, npm, cli]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: dist
+      - name: checksums
+        working-directory: dist
+        run: sha256sum discogs-* > SHA256SUMS && cat SHA256SUMS
+      - name: create the release
+        if: env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        shell: bash
+        run: |
+          PRE=(); [[ "$VERSION" == *-* ]] && PRE=(--prerelease)
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --title "v$VERSION" --notes-file dist/notes.md "${PRE[@]}" \
+            dist/discogs-* dist/SHA256SUMS

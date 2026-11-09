@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fmt-clippy:
+    name: rustfmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: clippy
+          components: rustfmt,clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: cargo test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: test-${{ matrix.os }}
+      - run: cargo test --workspace --locked --exclude discogs-node
+
+  fuzz:
+    name: fuzz the scanner (2 min)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          shared-key: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: seed corpus from the fixtures
+        run: |
+          mkdir -p fuzz/corpus/scan
+          for f in fixtures/*.xml; do
+            printf '\000' | cat - "$f" > "fuzz/corpus/scan/r-$(basename "$f")"
+            printf '\001' | cat - "$f" > "fuzz/corpus/scan/m-$(basename "$f")"
+          done
+      - run: cargo fuzz run scan -- -dict=fuzz/discogs.dict -max_total_time=120 -max_len=65536
+
+  package:
+    name: release readiness (versions, crate packaging, workflows)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-node-yarn
+      - run: node scripts/check-version.mjs
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: package
+      - run: cargo package -p discogs-core --locked --no-verify
+      - name: actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color
