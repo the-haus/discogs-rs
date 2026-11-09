@@ -1,0 +1,8 @@
+node_modules/
+*.node
+native.generated.d.ts
+LICENSE
+CHANGELOG.md
+npm/
+artifacts/
+*.tgz

@@ -1,0 +1,74 @@
+{
+  "name": "@discogs-rs/node",
+  "version": "0.1.0",
+  "description": "Read the Discogs monthly data dumps fast in Node.js: per-artist genre and style profiles from releases and masters, on every core (Rust, N-API).",
+  "license": "SEE LICENSE IN LICENSE",
+  "packageManager": "yarn@4.5.1",
+  "homepage": "https://github.com/the-haus/discogs-rs/tree/main/crates/discogs-node#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/the-haus/discogs-rs.git",
+    "directory": "crates/discogs-node"
+  },
+  "keywords": [
+    "discogs",
+    "dump",
+    "xml",
+    "music",
+    "genres",
+    "parquet",
+    "napi",
+    "rust"
+  ],
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "discogs-node.*.node",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "napi": {
+    "name": "discogs-node",
+    "package": {
+      "name": "@discogs-rs/node"
+    },
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "napi build --platform --release --js false --dts native.generated.d.ts",
+    "build:debug": "napi build --platform --js false --dts native.generated.d.ts",
+    "test": "node --test test/*.test.mjs",
+    "artifacts": "napi artifacts",
+    "create-npm-dirs": "napi create-npm-dir -t .",
+    "copy-license": "node -e \"const fs=require('fs');fs.copyFileSync('../../LICENCE.txt','LICENSE');fs.copyFileSync('../../CHANGELOG.md','CHANGELOG.md')\"",
+    "prepack": "yarn run copy-license",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4"
+  }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "discogs-node"
+edition.workspace = true
+version.workspace = true
+license-file.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+napi = { version = "2", default-features = false, features = ["napi6"] }
+napi-derive = "2"
+discogs-core.workspace = true
+
+[build-dependencies]
+napi-build = "2"
