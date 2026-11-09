@@ -21,9 +21,9 @@ use crate::targets::TargetSet;
 use crate::{Error, Result};
 
 /// The reader's chunk size.
-const CHUNK: usize = 4 << 20;
+pub(crate) const CHUNK: usize = 4 << 20;
 /// Chunks in flight between the reader and the decompressor.
-const CHUNKS_IN_FLIGHT: usize = 8;
+pub(crate) const CHUNKS_IN_FLIGHT: usize = 8;
 
 /// How to run a profile.
 #[derive(Clone, Debug, Default)]
@@ -112,7 +112,7 @@ pub fn profile_path(path: impl AsRef<Path>, targets: &TargetSet, options: &Profi
     profile_reader(file, targets, options)
 }
 
-fn parse_checksum(s: &str) -> Result<String> {
+pub(crate) fn parse_checksum(s: &str) -> Result<String> {
     let s = s.trim().to_ascii_lowercase();
     if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
         Ok(s)
@@ -123,36 +123,40 @@ fn parse_checksum(s: &str) -> Result<String> {
 
 /// The first error any thread hit, and a flag that tells the others to stop.
 #[derive(Default)]
-struct Failure {
-    error: Mutex<Option<Error>>,
-    stop: AtomicBool,
+pub(crate) struct Failure {
+    pub(crate) error: Mutex<Option<Error>>,
+    pub(crate) stop: AtomicBool,
 }
 
 impl Failure {
-    fn set(&self, e: Error) {
+    pub(crate) fn set(&self, e: Error) {
         let mut slot = self.error.lock().unwrap_or_else(|p| p.into_inner());
         if slot.is_none() {
             *slot = Some(e);
         }
         self.stop.store(true, Ordering::Relaxed);
     }
-    fn stopped(&self) -> bool {
+    /// Stops the other threads without an error (the consumer had enough).
+    pub(crate) fn halt(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+    pub(crate) fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
 }
 
-struct ReadStats {
-    bytes: u64,
-    read: Duration,
-    hash: Duration,
-    sha256: String,
+pub(crate) struct ReadStats {
+    pub(crate) bytes: u64,
+    pub(crate) read: Duration,
+    pub(crate) hash: Duration,
+    pub(crate) sha256: String,
 }
 
-struct SplitStats {
-    bytes: u64,
-    decompress: Duration,
-    split: Duration,
-    gzip: bool,
+pub(crate) struct SplitStats {
+    pub(crate) bytes: u64,
+    pub(crate) decompress: Duration,
+    pub(crate) split: Duration,
+    pub(crate) gzip: bool,
 }
 
 /// Profiles a dump read from `input`.
@@ -182,14 +186,22 @@ pub fn profile_reader<R: Read + Send>(input: R, targets: &TargetSet, options: &P
         let hash = expected.is_some() || !options.no_hash;
         let reader = s.spawn(move || read_and_hash(input, hash, chunk_tx, chunk_back_rx, failure));
         let splitter = s.spawn(move || {
+            // The kind decides the end tag: read it from the first bytes
+            // when not given.
+            let close = |head: &[u8]| -> Result<&'static [u8]> {
+                if kind_cell.get().is_none() {
+                    let _ = kind_cell.set(RecordKind::sniff(head).ok_or(Error::UnknownKind)?);
+                }
+                Ok(kind_cell.get().unwrap_or(&RecordKind::Releases).close_tag())
+            };
             decompress_and_split(
                 chunk_rx,
                 chunk_back_tx,
-                block_tx,
                 block_back_rx,
                 block_size,
-                kind_cell,
                 failure,
+                close,
+                |b| block_tx.send(b).is_ok(),
             )
         });
         let scanners: Vec<_> = (0..threads)
@@ -272,7 +284,7 @@ pub fn profile_reader<R: Read + Send>(input: R, targets: &TargetSet, options: &P
 }
 
 /// The reader thread: chunks of the input, hashed on the way.
-fn read_and_hash<R: Read>(
+pub(crate) fn read_and_hash<R: Read>(
     mut input: R,
     hash: bool,
     tx: Sender<Vec<u8>>,
@@ -400,15 +412,16 @@ impl<R: Read> Read for Timed<R> {
 }
 
 /// The decompression thread: gunzip (or pass through) and cut into blocks.
-#[allow(clippy::too_many_arguments)]
-fn decompress_and_split(
+/// `close` gets the first bytes (up to 64 KB) and names the end tag to cut
+/// after; `send` takes each block and says whether to go on.
+pub(crate) fn decompress_and_split(
     rx: Receiver<Vec<u8>>,
     back: Sender<Vec<u8>>,
-    blocks: Sender<Vec<u8>>,
     blocks_back: Receiver<Vec<u8>>,
     block_size: usize,
-    kind_cell: &OnceLock<RecordKind>,
     failure: &Failure,
+    close: impl FnOnce(&[u8]) -> Result<&'static [u8]>,
+    mut send: impl FnMut(Vec<u8>) -> bool,
 ) -> SplitStats {
     let waited = Rc::new(Cell::new(Duration::ZERO));
     let mut chunks = ChunkReader {
@@ -440,22 +453,17 @@ fn decompress_and_split(
         busy: Duration::ZERO,
     };
 
-    // The kind decides the end tag: read it from the first bytes when not given.
     let mut head = Vec::new();
-    if kind_cell.get().is_none() {
-        if let Err(e) = (&mut timed).take(64 << 10).read_to_end(&mut head) {
-            failure.set(Error::Io(e));
-        } else {
-            match RecordKind::sniff(&head) {
-                Some(k) => {
-                    let _ = kind_cell.set(k);
-                }
-                None => failure.set(Error::UnknownKind),
-            }
+    let mut close_tag: &'static [u8] = b"</release>";
+    if let Err(e) = (&mut timed).take(64 << 10).read_to_end(&mut head) {
+        failure.set(Error::Io(e));
+    } else {
+        match close(&head) {
+            Ok(tag) => close_tag = tag,
+            Err(e) => failure.set(e),
         }
     }
-    let kind = *kind_cell.get().unwrap_or(&RecordKind::Releases);
-    let mut splitter = Splitter::new(io::Cursor::new(head).chain(&mut timed), kind.close_tag(), block_size);
+    let mut splitter = Splitter::new(io::Cursor::new(head).chain(&mut timed), close_tag, block_size);
 
     let mut split = Duration::ZERO;
     while !failure.stopped() {
@@ -466,7 +474,7 @@ fn decompress_and_split(
         match splitter.next_block(buf) {
             Ok(Some(block)) => {
                 split += t.elapsed();
-                if blocks.send(block).is_err() {
+                if !send(block) {
                     break;
                 }
             }

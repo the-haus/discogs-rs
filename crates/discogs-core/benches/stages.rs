@@ -1,5 +1,6 @@
-//! Criterion benches of the two CPU stages after gunzip: the block
-//! splitter and the record scanner, on 32 MB of synthetic releases XML.
+//! Criterion benches of the CPU stages after gunzip: the block splitter,
+//! the record scanner, and records by id (split + scan + copy + in-order
+//! hand-over, on plain XML in memory), on 32 MB of synthetic XML.
 //!
 //!     cargo bench -p discogs-core --bench stages
 //!
@@ -10,7 +11,9 @@ use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use discogs_core::generate::{generate, targets_for_hit_rate, GenerateOptions};
 use discogs_core::split::{Splitter, DEFAULT_BLOCK_SIZE};
-use discogs_core::{Aggregator, Counters, RecordKind, Scanner, TargetSet};
+use discogs_core::{
+    records_reader, Aggregator, Counters, RecordFile, RecordKind, RecordScanner, RecordsOptions, Scanner, TargetSet,
+};
 
 const BYTES: u64 = 32 << 20;
 
@@ -95,5 +98,46 @@ fn scan_block(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, splitter, scan_block);
+fn records(c: &mut Criterion) {
+    let data = xml(RecordKind::Masters);
+    let ids: Vec<u32> = RecordScanner::new(RecordFile::Masters)
+        .records(&data)
+        .map(|f| f.id as u32)
+        .collect();
+    let mut g = c.benchmark_group("records");
+    g.sample_size(10);
+    g.throughput(Throughput::Bytes(data.len() as u64));
+    let many = RecordsOptions::new(RecordFile::Masters).scanner_threads();
+    for (label, set) in [
+        ("all", None),
+        ("1% ids", Some(TargetSet::from_ids(ids.iter().copied().step_by(100)))),
+    ] {
+        for threads in [1, many] {
+            let options = RecordsOptions {
+                ids: set.clone(),
+                threads,
+                no_hash: true,
+                ..RecordsOptions::new(RecordFile::Masters)
+            };
+            g.bench_with_input(
+                BenchmarkId::new(label, format!("{threads} threads")),
+                &options,
+                |b, o| {
+                    b.iter(|| {
+                        let mut n = 0usize;
+                        records_reader(&data[..], o, &mut |batch| {
+                            n += batch.len();
+                            true
+                        })
+                        .unwrap();
+                        black_box(n)
+                    });
+                },
+            );
+        }
+    }
+    g.finish();
+}
+
+criterion_group!(benches, splitter, scan_block, records);
 criterion_main!(benches);

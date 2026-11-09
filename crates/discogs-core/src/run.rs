@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::dumps::{self, checksum_file, dump_file_in, parse_checksums};
 use crate::output::write_rows;
 use crate::pipeline::{hex, profile_reader, Profile, ProfileOptions, Summary};
+use crate::records::{records_reader, RecordBatch, RecordsOptions, RecordsSummary};
 use crate::targets::TargetSet;
 use crate::{Error, Result};
 
@@ -442,6 +443,120 @@ pub fn run_profile(targets: &TargetSet, options: &RunOptions) -> Result<RunSumma
         download_seconds,
         attempts,
         write_seconds,
+    })
+}
+
+/// A records run ([`crate::records`]): where the input comes from.
+#[derive(Clone, Debug)]
+pub struct RecordsRunOptions {
+    /// A `.xml.gz` / `.xml` path, or an `http(s)://` URL (feature `http`).
+    pub source: String,
+    /// The expected SHA-256, or `"auto"` (as [`RunOptions::checksum`]).
+    /// Checked once the whole input is read: on a mismatch the run fails
+    /// after the batches were handed over.
+    pub checksum: Option<String>,
+    /// URL sources: extra whole tries after a transport failure, only while
+    /// no batch has been handed over yet. Default 2.
+    pub retries: u32,
+    /// The data site, for `auto` on a file with no `CHECKSUM.txt` beside it.
+    pub base_url: Option<String>,
+    /// URL sources: the longest wait for a connection or the next bytes.
+    pub timeout: Option<Duration>,
+    pub records: RecordsOptions,
+}
+
+impl RecordsRunOptions {
+    pub fn new(source: impl Into<String>, records: RecordsOptions) -> Self {
+        Self {
+            source: source.into(),
+            checksum: None,
+            retries: 2,
+            base_url: None,
+            timeout: None,
+            records,
+        }
+    }
+
+    /// The profile run options that carry the same source settings.
+    fn as_run(&self) -> RunOptions {
+        RunOptions {
+            source: self.source.clone(),
+            checksum: self.checksum.clone(),
+            retries: self.retries,
+            base_url: self.base_url.clone(),
+            timeout: self.timeout,
+            ..Default::default()
+        }
+    }
+}
+
+/// What a records run did.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RecordsRunSummary {
+    #[serde(flatten)]
+    pub records: RecordsSummary,
+    pub source: String,
+    pub expected_sha256: Option<String>,
+    /// Seconds waiting on the network; 0 for a file.
+    pub download_seconds: f64,
+    pub attempts: u32,
+}
+
+/// Reads records from a path or URL, the expected checksum given or looked
+/// up (`auto`), handing batches to `sink` in file order (`false` stops).
+pub fn run_records(
+    options: &RecordsRunOptions,
+    sink: &mut dyn FnMut(RecordBatch) -> bool,
+) -> Result<RecordsRunSummary> {
+    let run = options.as_run();
+    let expected = expected_checksum(&run)?;
+    let records = RecordsOptions {
+        checksum: expected.clone(),
+        ..options.records.clone()
+    };
+    let url = is_url(&options.source);
+    let retries = if url { options.retries } else { 0 };
+    let clock = Arc::new(Mutex::new(Duration::ZERO));
+    let mut attempts = 0;
+    let mut delivered = false;
+    let summary = loop {
+        attempts += 1;
+        let mut counted = |b: RecordBatch| {
+            delivered = true;
+            sink(b)
+        };
+        let tried = if url {
+            #[cfg(feature = "http")]
+            {
+                http(&run)?
+                    .open(&options.source)
+                    .and_then(|body| records_reader(body.timed(clock.clone()), &records, &mut counted))
+            }
+            #[cfg(not(feature = "http"))]
+            {
+                Err(no_http(&options.source))
+            }
+        } else {
+            File::open(&options.source)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", options.source)).into())
+                .and_then(|f| records_reader(f, &records, &mut counted))
+        };
+        match tried {
+            Err(Error::Network(_)) if attempts <= retries && !delivered => continue,
+            other => break other?,
+        }
+    };
+    let download_seconds = if url {
+        clock.lock().unwrap_or_else(|p| p.into_inner()).as_secs_f64()
+    } else {
+        0.0
+    };
+    Ok(RecordsRunSummary {
+        records: summary,
+        source: options.source.clone(),
+        expected_sha256: expected,
+        download_seconds,
+        attempts,
     })
 }
 

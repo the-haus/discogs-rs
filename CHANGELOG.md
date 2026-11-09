@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.3.0 — unreleased
+
+### Added
+
+- Records by id: `discogs records --file masters|artists|labels --input
+  <path or URL> [--ids ids.txt] [--checksum auto] [--out out.jsonl|-]`
+  writes the raw XML body of each record whose id is in the set (every
+  record without), in file order, as JSON lines `{id, file, xml}`. A body
+  is cut exactly as Festimap's TypeScript scan cuts it (start match to the
+  first end tag after it, end tag left out). Same reader, SHA-256, zlib-rs
+  gunzip and splitter as `profile`, a parallel scan over a bitset, and a
+  collector that hands blocks over in order with a bounded number in
+  flight. A record out of id order fails the run (`Error::Dump`).
+- Node: `records(options)`, an async iterable of batches
+  (`{ ids: Uint32Array, offsets: Uint32Array, xml: Buffer }`) with
+  `summary()` and `close()`; `recordsOf(batch)`; the native
+  `openRecords(options)` → `RecordsReader` (`next()`, `close()`,
+  `summary()`). Leaving the loop stops the run.
+- Rust: `records` module (`RecordFile`, `RecordScanner`, `RecordBatch`,
+  `RecordsOptions` with a `cancel` flag, `records_reader`, `records_path`,
+  `collect_records`), `run_records` / `RecordsRunOptions` /
+  `RecordsRunSummary` (URL, `auto` checksum, retries before the first
+  batch).
+- Fixtures: Festimap's artists and labels samples, the first 40 records of
+  the 2026-10-01 artists and labels dumps. A property test and the
+  `records` fuzz target (blocks find the records one scan finds); a
+  criterion `records` bench.
+
+### Changed
+
+- The profile pipeline's decompress-and-split stage is shared with
+  records (the head is always read first; the output is unchanged).
+
+### Fixed
+
+- Node: `DISCOGS_RS_NODE_BINARY` naming the package's own `index.js` no
+  longer loads it into itself.
+
 ## 0.2.0 — unreleased
 
 ### Added

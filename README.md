@@ -39,6 +39,11 @@ genres and styles does it release under, by year and by format?
 - per-thread sums are merged into rows, written as Parquet (zstd) or JSON
   lines.
 
+It also hands over the **raw XML of records by id** from the `masters`,
+`artists` and `labels` files (`discogs records`, Node `records()`), through
+the same reader, gunzip, splitter and parallel scan, in file order: see
+[Records by id](#records-by-id).
+
 It is built for [Festimap](https://festimap.com), which maps the counts to
 its own genre tree and weighs them (recency, format) itself, so the
 weighting can be retuned without reading 80 GB again. It is a sibling of
@@ -50,6 +55,7 @@ layout.
 - [Quick start](#quick-start)
 - [What counts](#what-counts)
 - [The output](#the-output)
+- [Records by id](#records-by-id)
 - [Performance](#performance)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -268,6 +274,68 @@ JSON lines carry the same fields:
 {"artist_id":2,"kind":"style","name":"Hip Hop/Electro","year":1984,"format_class":"album","promo":false,"weight":0.25,"share":0.25,"records":1}
 ```
 
+## Records by id
+
+`discogs records` (Node: `records()` / `openRecords()`, Rust:
+`run_records` / `records_reader`) reads a `masters`, `artists` or `labels`
+file and hands over the raw XML of the records whose ids you give (or of
+every record), **in file order**, with the file's SHA-256 checked on the
+way. No field is parsed: the consumer parses the bodies, so a TypeScript
+reader and this one can share one parser.
+
+A record is cut exactly as Festimap's TypeScript scan cuts it:
+
+| file | starts at | body ends before |
+|---|---|---|
+| `masters` | `<master id="N">` | the first `</master>` after it |
+| `artists` | `<artist><id>N</id>` | the first `</artist>` after it |
+| `labels` | `<label><id>N</id>` | the first `</label>` after it |
+
+Only top-level records match (a nested artist or label carries its id as
+an attribute). A label's body stops at its first sub-label's end, after its
+id, name, profile, URLs and parent. The end tag is left out. The search for
+the next record resumes after it. A record with no end tag before the end
+of the input is dropped. A record whose id is below the one before it fails
+the run (the dumps are written in id order).
+
+```sh
+discogs records --file artists --input discogs_20261101_artists.xml.gz \
+  --ids artist-ids.txt --checksum auto --out artists.jsonl
+# {"id":1,"file":"artists","xml":"<artist><id>1</id><name>The Persuader</name>…"}
+```
+
+Without `--ids` every record is written; without `--out` nothing is
+(timing). The checksum is known only once the whole file is read: on a
+mismatch the command fails and leaves no output (lines go to
+`<out>.partial` first). Node streams the batches as they come, so there a
+mismatch throws at the end of the loop, after the batches were handed over:
+
+```js
+import { records, recordsOf } from "@discogs-rs/node";
+
+const run = records({ source: "discogs_20261101_artists.xml.gz", file: "artists", ids: Uint32Array.from(ids), checksum: "auto" });
+for await (const batch of run) {
+  for (const { id, xml } of recordsOf(batch)) parse(id, xml);
+}
+console.log(run.summary()); // { records, matched, mbPerSecond, sha256, … }
+```
+
+A batch is `{ ids: Uint32Array, offsets: Uint32Array, xml: Buffer }` (one
+block's wanted records: record `i` is `xml[offsets[i], offsets[i + 1])`), so
+crossing into JS costs one Buffer per block, not an object per record. The
+run stays two batches ahead of the loop (backpressure); leaving the loop,
+or `close()`, stops it. `openRecords()` is the native reader behind
+`records()`: `next()` (a Promise of a batch, or null at the end), `close()`
+and `summary()`.
+
+How it works: the splitter cuts blocks after the file's end tag; scanners
+find the start pattern with `memchr::memmem`, read the id, test it against
+a bitset, and copy a wanted record's bytes out; a collector gives the
+blocks back in order, with tickets bounding the blocks in flight. A cut
+right after an end tag never splits a record (no start pattern holds an
+end tag), so blocks find exactly the records one scan of the whole finds:
+a property test and the `records` fuzz target check it.
+
 ## Performance
 
 Apple M1 Max (8 performance cores), macOS, release build, a 2.0 GB
@@ -296,6 +364,22 @@ at 1% and 4.6 GiB/s at 10%, and 3.6 / 3.2 / 1.9 GiB/s on masters.
 From a URL, the network is the ceiling unless the link is faster than
 about 1 GB/s of XML (some 160 MB/s of gzip).
 
+**Records by id, on the real 2026-10-01 dumps** (same machine, files on an
+external SSD, sha256 checked, `discogs records` with no output; Festimap's
+TypeScript reader on Node 24 for comparison, the same records cut):
+
+| file | XML | records | every record | 50,000 ids | TypeScript, every record |
+|---|---|---|---|---|---|
+| artists (499 MB .gz) | 2.26 GB | 10,243,337 | 3.4 s (664 MB/s) | 4.4 s (512 MB/s) | 23.0 s (98 MB/s) |
+| labels (91 MB .gz) | 0.45 GB | 2,426,075 | 0.6 s (699 MB/s) | 0.7 s (682 MB/s) | 5.7 s (79 MB/s) |
+| masters (630 MB .gz) | 3.18 GB | 2,598,586 | 4.1 s (769 MB/s) | 4.9 s (645 MB/s) | 28.3 s (112 MB/s) |
+
+Every record decoded into JS strings through `openRecords` takes 4.9 s
+(artists), 1.0 s (labels) and 4.1 s (masters). Peak RSS of the CLI: 320 to
+400 MB. Criterion (`records`, 32 MB of synthetic masters XML in memory):
+every record 1.5 GiB/s on one thread, 2.3 GiB/s on nine; 1% of the ids
+3.7 GiB/s.
+
 **Decompression is the ceiling.** One scanner thread keeps up with zlib-rs
 with room to spare (the scan costs about 0.2 CPU-seconds per GB), so more
 threads change nothing end to end; they matter only for plain XML input.
@@ -304,11 +388,11 @@ threads change nothing end to end; they matter only for plain XML input.
 
 | path | |
 |---|---|
-| `crates/discogs-core` | the engine: targets, splitter, scanner, format classes, aggregation, pipeline, output, synthetic generator; `dumps` (names, links, CHECKSUM.txt), `remote` (HTTPS), `run` (checksum lookup, state, retries, keep) |
-| `crates/discogs-cli` | the `discogs` command: `profile`, `checksum`, `latest`, `bench` |
+| `crates/discogs-core` | the engine: targets, splitter, scanner, format classes, aggregation, pipeline, output, synthetic generator; `records` (records by id); `dumps` (names, links, CHECKSUM.txt), `remote` (HTTPS), `run` (checksum lookup, state, retries, keep) |
+| `crates/discogs-cli` | the `discogs` command: `profile`, `records`, `checksum`, `latest`, `bench` |
 | `crates/discogs-node` | the napi-rs binding, published as `@discogs-rs/node` |
-| `fixtures/` | hand-written releases and masters, targets, and the first 40 records of the 2026-11-01 dumps |
-| `fuzz/` | cargo-fuzz target for the scanner and splitter |
+| `fixtures/` | hand-written releases and masters, targets, the first 40 records of the 2026-11-01 releases and masters, Festimap's artists and labels samples and the first 40 records of the 2026-10-01 artists and labels |
+| `fuzz/` | cargo-fuzz targets: the profile scanner and splitter (`scan`), records (`records`) |
 
 ## Development
 
@@ -316,9 +400,10 @@ threads change nothing end to end; they matter only for plain XML input.
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --exclude discogs-node      # the network tests use a local server
 cargo test -p discogs-core --test http -- --ignored # reads the real data.discogs.com listing (never a dump)
-cargo bench -p discogs-core --bench stages          # criterion: splitter, scan_block
+cargo bench -p discogs-core --bench stages          # criterion: splitter, scan_block, records
 corepack yarn install && cd crates/discogs-node && corepack yarn build && corepack yarn test
 cargo +nightly fuzz run scan -- -dict=fuzz/discogs.dict   # needs cargo-fuzz; macOS: add --sanitizer none
+cargo +nightly fuzz run -s none records -- -dict=fuzz/discogs.dict
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -331,8 +416,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 - One gzip thread: about 1 GB/s of XML on an M1, so the decompressor bounds
   the run. A parallel single-member gunzip is planned only if a real run
   measures below 400 MB/s.
-- Only `profile`: reading `artists`, `labels` and `masters` records by id
-  comes later.
+- Records by id hand over raw XML: parsing the fields is the consumer's.
+  A records checksum mismatch is known only after the last batch.
 - Masters have no format class (the dump gives masters no formats).
 
 ## CI/CD

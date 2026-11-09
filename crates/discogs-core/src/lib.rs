@@ -18,6 +18,10 @@
 //! - the per-thread sums are merged into sorted [`Row`]s, written by
 //!   [`output`] as Parquet or JSON lines.
 //!
+//! [`records`] reads the raw XML of the `masters`, `artists` and `labels`
+//! records whose ids are in a set, through the same reader and splitter,
+//! handed over in file order; [`run::run_records`] adds the source handling.
+//!
 //! [`run::run_profile`] wraps it for the CLI and the Node binding: a path or
 //! an HTTPS URL ([`remote`], feature `http`, on by default), the expected
 //! checksum looked up in the dump's `CHECKSUM.txt` ([`dumps`]), whole-file
@@ -32,6 +36,7 @@ pub mod format;
 pub mod generate;
 pub mod output;
 pub mod pipeline;
+pub mod records;
 #[cfg(feature = "http")]
 pub mod remote;
 pub mod run;
@@ -43,7 +48,11 @@ pub mod xml;
 pub use aggregate::{Aggregator, Row, RowKind};
 pub use format::FormatClass;
 pub use pipeline::{profile_path, profile_reader, Profile, ProfileOptions, Stages, Summary};
-pub use run::{run_profile, RunOptions, RunSummary};
+pub use records::{
+    collect_records, records_path, records_reader, RecordBatch, RecordFile, RecordScanner, RecordStages,
+    RecordsOptions, RecordsSummary,
+};
+pub use run::{run_profile, run_records, RecordsRunOptions, RecordsRunSummary, RunOptions, RunSummary};
 pub use scan::{Counters, RecordKind, Scanner};
 pub use targets::TargetSet;
 
@@ -60,6 +69,10 @@ pub enum Error {
     BadChecksum(String),
     #[error("cannot tell a releases dump from a masters dump by its first bytes; give the kind")]
     UnknownKind,
+    /// The input is no well-formed dump of its kind (records out of id
+    /// order, an id above 2^32).
+    #[error("{0}")]
+    Dump(String),
     #[error("output: {0}")]
     Output(String),
     /// A transport failure (a dropped connection, a timeout, a 5xx): the

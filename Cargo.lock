@@ -615,20 +615,21 @@ dependencies = [
 
 [[package]]
 name = "discogs-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
  "discogs-core",
  "flate2",
  "mimalloc",
+ "serde",
  "serde_json",
  "sha2",
 ]
 
 [[package]]
 name = "discogs-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -650,8 +651,9 @@ dependencies = [
 
 [[package]]
 name = "discogs-node"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
+ "crossbeam-channel",
  "discogs-core",
  "napi",
  "napi-build",

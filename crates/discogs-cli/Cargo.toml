@@ -21,6 +21,7 @@ mimalloc = ["dep:mimalloc"]
 [dependencies]
 discogs-core.workspace = true
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 flate2.workspace = true

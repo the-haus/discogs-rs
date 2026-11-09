@@ -9,14 +9,14 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.2.0"
+version = "0.3.0"
 license-file = "LICENCE.txt"
 repository = "https://github.com/the-haus/discogs-rs"
 rust-version = "1.87"
 
 [workspace.dependencies]
 # Internal crates.
-discogs-core = { path = "crates/discogs-core", version = "=0.2.0" }
+discogs-core = { path = "crates/discogs-core", version = "=0.3.0" }
 
 # External crates.
 anyhow = "1"

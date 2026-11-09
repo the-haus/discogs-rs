@@ -213,3 +213,52 @@ mod network {
         assert_eq!(s.hits(LINK), 1);
     }
 }
+
+fn records(file: &str, input: &str, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_discogs"))
+        .arg("records")
+        .arg("--file")
+        .arg(file)
+        .arg("--input")
+        .arg(fixtures().join(input))
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn records_writes_the_raw_bodies_as_jsonl() {
+    let dir = tmp();
+    let ids = dir.join("label-ids.txt");
+    std::fs::write(&ids, "2\n4\n999\n").unwrap();
+    let out = dir.join("labels.jsonl");
+    let o = records(
+        "labels",
+        "real-labels-20261001-head.xml",
+        &["--ids", ids.to_str().unwrap(), "--out", out.to_str().unwrap(), "--json"],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let summary: serde_json::Value = serde_json::from_slice(&o.stderr).unwrap();
+    assert_eq!(summary["records"], 40);
+    assert_eq!(summary["matched"], 2);
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["id"], 2);
+    assert_eq!(lines[0]["file"], "labels");
+    assert!(lines[1]["xml"].as_str().unwrap().starts_with("<label><id>4</id><name>"));
+
+    // A mismatch leaves no output.
+    let bad = dir.join("bad.jsonl");
+    let o = records(
+        "masters",
+        "masters.xml",
+        &["--out", bad.to_str().unwrap(), "--checksum", &"a".repeat(64)],
+    );
+    assert!(!o.status.success());
+    assert!(!bad.exists());
+    assert!(!PathBuf::from(format!("{}.partial", bad.display())).exists());
+}

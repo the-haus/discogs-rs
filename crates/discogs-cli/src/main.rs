@@ -9,7 +9,10 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use discogs_core::generate::{generate, targets_for_hit_rate, GenerateOptions};
 use discogs_core::remote::{Http, HttpOptions};
-use discogs_core::{profile_path, run_profile, ProfileOptions, RecordKind, RunOptions, Summary, TargetSet};
+use discogs_core::{
+    profile_path, run_profile, run_records, ProfileOptions, RecordFile, RecordKind, RecordsOptions, RecordsRunOptions,
+    RunOptions, Summary, TargetSet,
+};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -68,6 +71,51 @@ enum Command {
         #[arg(long)]
         no_hash: bool,
         /// Print the summary as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        site: Site,
+    },
+    /// The raw XML of the masters, artists or labels records with the given
+    /// ids (or of every record), in file order, as JSON lines
+    /// `{"id":…,"file":"artists","xml":"<artist><id>…"}`: the body from the
+    /// start tag to the end tag, the end tag left out.
+    Records {
+        /// The dump file: a .xml.gz or .xml path, or an https:// URL.
+        #[arg(long)]
+        input: String,
+        /// `masters`, `artists` or `labels`.
+        #[arg(long)]
+        file: RecordFile,
+        /// The ids wanted, one per line; every record without.
+        #[arg(long)]
+        ids: Option<PathBuf>,
+        /// The input's expected SHA-256, or `auto` (CHECKSUM.txt). Checked
+        /// once the input is read: on a mismatch the command fails and
+        /// writes no output (lines go to `<out>.partial` until then).
+        #[arg(long)]
+        checksum: Option<String>,
+        /// URL input: extra whole tries after a dropped connection (while
+        /// nothing is written yet).
+        #[arg(long, default_value_t = 2)]
+        retries: u32,
+        /// URL input: seconds to wait for a connection or the next bytes.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// Scanner threads (default: cores less one).
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
+        /// Block size in MB.
+        #[arg(long, default_value_t = 16)]
+        block_mb: usize,
+        /// Output: a .jsonl path, or `-` for stdout. Without it nothing is
+        /// written (timing runs).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Skip the SHA-256 of the input (ignored with --checksum).
+        #[arg(long)]
+        no_hash: bool,
+        /// Print the summary as JSON on stderr.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -195,6 +243,82 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Records {
+            input,
+            file,
+            ids,
+            checksum,
+            retries,
+            timeout,
+            threads,
+            block_mb,
+            out,
+            no_hash,
+            json,
+            site,
+        } => {
+            let ids = match ids {
+                Some(path) => {
+                    let text = std::fs::read(&path).with_context(|| format!("{}", path.display()))?;
+                    Some(TargetSet::parse(&text)?)
+                }
+                None => None,
+            };
+            let options = RecordsRunOptions {
+                checksum,
+                retries,
+                base_url: Some(site.base_url),
+                timeout: Some(Duration::from_secs(timeout)),
+                ..RecordsRunOptions::new(
+                    input,
+                    RecordsOptions {
+                        ids,
+                        threads,
+                        block_size: block_mb << 20,
+                        no_hash,
+                        ..RecordsOptions::new(file)
+                    },
+                )
+            };
+            let run = write_records(&options, out.as_deref())?;
+            let s = &run.records;
+            if json {
+                eprintln!("{}", serde_json::to_string_pretty(&run)?);
+            } else {
+                eprintln!(
+                    "{} file, {} scanner threads, sha256 {}",
+                    s.file,
+                    s.threads,
+                    if s.sha256.is_empty() { "-" } else { &s.sha256 }
+                );
+                eprintln!(
+                    "records {}  matched {} of {} ids  batches {}",
+                    s.records,
+                    s.matched,
+                    if s.ids == 0 {
+                        "all".to_string()
+                    } else {
+                        s.ids.to_string()
+                    },
+                    s.batches
+                );
+                let st = &s.seconds;
+                eprintln!(
+                    "in {:.1} MB  xml {:.1} MB  seconds: read {:.2}  hash {:.2}  decompress {:.2}  split {:.2}  scan {:.2} (cpu)  write {:.2}  total {:.2}",
+                    s.bytes_in as f64 / 1e6,
+                    s.bytes_decompressed as f64 / 1e6,
+                    st.read,
+                    st.hash,
+                    st.decompress,
+                    st.split,
+                    st.scan,
+                    st.deliver,
+                    st.total
+                );
+                eprintln!("{:.0} MB/s of XML end to end", s.mb_per_s);
+            }
+            Ok(())
+        }
         Command::Checksum { dump, json, site } => {
             let sums = site.http()?.checksums(&dump)?;
             if json {
@@ -218,6 +342,68 @@ fn main() -> Result<()> {
             kind,
             json,
         } => bench(gb, &dir, &hit_rates, threads, kind, json),
+    }
+}
+
+/// Runs records, writing JSON lines to `out` (`-` is stdout; a path is
+/// written to `<out>.partial`, renamed once the run, checksum included,
+/// succeeds).
+fn write_records(options: &RecordsRunOptions, out: Option<&Path>) -> Result<discogs_core::RecordsRunSummary> {
+    #[derive(serde::Serialize)]
+    struct Line<'a> {
+        id: u32,
+        file: &'a str,
+        xml: &'a str,
+    }
+    let file = options.records.file.as_str();
+    let (mut writer, partial): (Option<Box<dyn Write>>, Option<PathBuf>) = match out {
+        None => (None, None),
+        Some(p) if p.as_os_str() == "-" => (Some(Box::new(BufWriter::new(std::io::stdout().lock()))), None),
+        Some(p) => {
+            let mut partial = p.as_os_str().to_owned();
+            partial.push(".partial");
+            let partial = PathBuf::from(partial);
+            let f = File::create(&partial).with_context(|| format!("{}", partial.display()))?;
+            (Some(Box::new(BufWriter::with_capacity(4 << 20, f))), Some(partial))
+        }
+    };
+    let mut failed: Option<std::io::Error> = None;
+    let run = run_records(options, &mut |batch| {
+        let Some(w) = writer.as_mut() else { return true };
+        for (id, xml) in batch.iter() {
+            let xml = String::from_utf8_lossy(xml);
+            let line = Line { id, file, xml: &xml };
+            if let Err(e) = serde_json::to_writer(&mut *w, &line)
+                .map_err(std::io::Error::from)
+                .and_then(|_| w.write_all(b"\n"))
+            {
+                failed = Some(e);
+                return false;
+            }
+        }
+        true
+    });
+    let run = match (run, failed) {
+        (_, Some(e)) => Err(e.into()),
+        (r, None) => r.map_err(anyhow::Error::from),
+    };
+    let flushed = writer.map_or(Ok(()), |mut w| w.flush());
+    match (run, partial) {
+        (Ok(run), Some(partial)) => {
+            flushed?;
+            std::fs::rename(&partial, out.expect("a path"))?;
+            Ok(run)
+        }
+        (Ok(run), None) => {
+            flushed?;
+            Ok(run)
+        }
+        (Err(e), partial) => {
+            if let Some(p) = partial {
+                let _ = std::fs::remove_file(p);
+            }
+            Err(e)
+        }
     }
 }
 
