@@ -1,6 +1,6 @@
 {
   "name": "@discogs-rs/node",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Read the Discogs monthly data dumps fast in Node.js: per-artist genre and style profiles from releases and masters, on every core (Rust, N-API).",
   "license": "SEE LICENSE IN LICENSE",
   "packageManager": "yarn@4.5.1",

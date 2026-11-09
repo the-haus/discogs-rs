@@ -1,14 +1,18 @@
 #![deny(clippy::all)]
 
 //! Node.js binding of discogs-rs: `profileArtists()` runs a whole profile
-//! pass (read, sha256, gunzip, split, scan, merge, write) off the JS
-//! thread and resolves with its summary.
+//! pass (read or download, sha256, gunzip, split, scan, merge, write) off
+//! the JS thread and resolves with its summary; `latestDump()` and
+//! `dumpChecksums()` read the data site. Every call is an napi
+//! `AsyncTask`: the work, HTTP included (a blocking client with its own
+//! runtime thread), runs off the event loop.
 
-use std::path::Path;
-use std::time::Instant;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
 
-use discogs_core::output::write_rows;
-use discogs_core::{profile_path, ProfileOptions, RecordKind, Summary, TargetSet};
+use discogs_core::remote::{Http, HttpOptions};
+use discogs_core::{run_profile, ProfileOptions, RecordKind, RunOptions, RunSummary, TargetSet};
 use napi::bindgen_prelude::{AsyncTask, Uint32Array};
 use napi::{Env, Error, Result, Task};
 use napi_derive::napi;
@@ -16,11 +20,29 @@ use napi_derive::napi;
 /// Options of `profileArtists`.
 #[napi(object)]
 pub struct ProfileArtistsOptions {
-    /// The dump: a `.xml.gz` or `.xml` file path. (HTTPS URLs: M2.)
+    /// The dump: a `.xml.gz` or `.xml` file path, or an `https://` URL
+    /// (streamed; stored only with `keep`).
     pub source: String,
-    /// The source's expected SHA-256 (64 hex digits). On a mismatch the
-    /// promise rejects and nothing is written.
+    /// The source's expected SHA-256 (64 hex digits), or `"auto"`: the sum
+    /// the dump's `CHECKSUM.txt` gives for the source's file name. On a
+    /// mismatch the promise rejects and nothing is written.
     pub checksum: Option<String>,
+    /// Skip-unchanged state file (JSON). A dump already profiled with the
+    /// same checksum (known before reading: given or `"auto"`), targets and
+    /// options, whose output is still there, is not read again: the summary
+    /// says `skipped: true`.
+    pub state: Option<String>,
+    /// URL sources: also write the download to this path as it streams
+    /// (renamed into place once the run succeeds).
+    pub keep: Option<String>,
+    /// URL sources: extra whole tries after a dropped connection, a
+    /// timeout, a 5xx or a 429 (default 2; data.discogs.com cannot resume).
+    pub retries: Option<u32>,
+    /// URL sources: seconds to wait for a connection or the next bytes
+    /// (default 120).
+    pub timeout_seconds: Option<u32>,
+    /// The data site (default `https://data.discogs.com/`).
+    pub base_url: Option<String>,
     /// Target Discogs artist ids.
     pub targets: Uint32Array,
     /// `"releases"` or `"masters"`; read from the file when absent.
@@ -77,28 +99,37 @@ pub struct ProfileSummary {
     pub stages: ProfileStages,
     /// MB (10^6 bytes) of XML per wall second.
     pub mb_per_second: f64,
+    /// Nothing was read: unchanged since the run the state file recorded
+    /// (the counts are that run's).
+    pub skipped: bool,
+    /// The source as given.
+    pub source: String,
+    /// The expected checksum used (given or from `CHECKSUM.txt`), if any.
+    pub expected_sha256: Option<String>,
+    /// Seconds waiting on the network (requests and body reads), over all
+    /// attempts; 0 for a file.
+    pub download_seconds: f64,
+    /// Tries of the source (more than 1 after a dropped connection; 0 when
+    /// skipped).
+    pub attempts: u32,
 }
 
 pub struct ProfileTask {
-    source: String,
-    out: String,
     targets: TargetSet,
-    options: ProfileOptions,
+    options: RunOptions,
 }
 
 impl Task for ProfileTask {
-    type Output = (Summary, f64);
+    type Output = RunSummary;
     type JsValue = ProfileSummary;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        let fail = |e: discogs_core::Error| Error::from_reason(e.to_string());
-        let profile = profile_path(Path::new(&self.source), &self.targets, &self.options).map_err(fail)?;
-        let t = Instant::now();
-        write_rows(&profile.rows, &self.out).map_err(fail)?;
-        Ok((profile.summary, t.elapsed().as_secs_f64()))
+        run_profile(&self.targets, &self.options).map_err(|e| Error::from_reason(e.to_string()))
     }
 
-    fn resolve(&mut self, _env: Env, (s, write): Self::Output) -> Result<Self::JsValue> {
+    fn resolve(&mut self, _env: Env, run: Self::Output) -> Result<Self::JsValue> {
+        let write = run.write_seconds;
+        let s = run.profile;
         let st = s.seconds;
         Ok(ProfileSummary {
             kind: s.kind,
@@ -127,6 +158,11 @@ impl Task for ProfileTask {
                 total: st.total + write,
             },
             mb_per_second: s.mb_per_s,
+            skipped: run.skipped,
+            source: run.source,
+            expected_sha256: run.expected_sha256,
+            download_seconds: run.download_seconds,
+            attempts: run.attempts,
         })
     }
 }
@@ -145,17 +181,82 @@ pub fn profile_artists(options: ProfileArtistsOptions) -> Result<AsyncTask<Profi
         .map_err(Error::from_reason)?;
     let targets = TargetSet::from_ids(options.targets.iter().copied());
     Ok(AsyncTask::new(ProfileTask {
-        source: options.source,
-        out: options.out,
         targets,
-        options: ProfileOptions {
-            threads: options.threads.unwrap_or(0) as usize,
-            block_size: options.block_size.unwrap_or(0) as usize,
+        options: RunOptions {
+            source: options.source,
+            out: PathBuf::from(options.out),
             checksum: options.checksum,
-            kind,
-            no_hash: false,
+            state: options.state.map(PathBuf::from),
+            keep: options.keep.map(PathBuf::from),
+            retries: options.retries.unwrap_or(2),
+            base_url: options.base_url,
+            timeout: options.timeout_seconds.map(|s| Duration::from_secs(s.into())),
+            profile: ProfileOptions {
+                threads: options.threads.unwrap_or(0) as usize,
+                block_size: options.block_size.unwrap_or(0) as usize,
+                checksum: None,
+                kind,
+                no_hash: false,
+            },
         },
     }))
+}
+
+/// Options of `latestDump` and `dumpChecksums`.
+#[napi(object)]
+pub struct SiteOptions {
+    /// The data site (default `https://data.discogs.com/`).
+    pub base_url: Option<String>,
+}
+
+fn http(site: Option<SiteOptions>) -> Result<Http> {
+    let mut o = HttpOptions::default();
+    if let Some(base) = site.and_then(|s| s.base_url) {
+        o.base_url = base;
+    }
+    Http::new(o).map_err(|e| Error::from_reason(e.to_string()))
+}
+
+pub struct LatestTask(Option<Http>);
+
+impl Task for LatestTask {
+    type Output = String;
+    type JsValue = String;
+    fn compute(&mut self) -> Result<String> {
+        let http = self.0.take().expect("computed once");
+        http.latest_dump().map_err(|e| Error::from_reason(e.to_string()))
+    }
+    fn resolve(&mut self, _env: Env, dump: String) -> Result<String> {
+        Ok(dump)
+    }
+}
+
+/// The newest complete Discogs dump (`"20261101"`): the newest whose
+/// `CHECKSUM.txt` is listed on the data site.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn latest_dump(options: Option<SiteOptions>) -> Result<AsyncTask<LatestTask>> {
+    Ok(AsyncTask::new(LatestTask(Some(http(options)?))))
+}
+
+pub struct ChecksumsTask(Option<Http>, String);
+
+impl Task for ChecksumsTask {
+    type Output = HashMap<String, String>;
+    type JsValue = HashMap<String, String>;
+    fn compute(&mut self) -> Result<Self::Output> {
+        let http = self.0.take().expect("computed once");
+        let sums = http.checksums(&self.1).map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(sums.into_iter().collect())
+    }
+    fn resolve(&mut self, _env: Env, sums: Self::Output) -> Result<Self::JsValue> {
+        Ok(sums)
+    }
+}
+
+/// A dump's `CHECKSUM.txt`: file name → SHA-256.
+#[napi(ts_return_type = "Promise<Record<string, string>>")]
+pub fn dump_checksums(dump: String, options: Option<SiteOptions>) -> Result<AsyncTask<ChecksumsTask>> {
+    Ok(AsyncTask::new(ChecksumsTask(Some(http(options)?), dump)))
 }
 
 /// The package version.

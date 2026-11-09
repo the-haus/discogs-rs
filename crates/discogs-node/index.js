@@ -80,4 +80,6 @@ const native = loadNative();
 
 // Named one by one, so that ESM `import { profileArtists }` finds them.
 module.exports.profileArtists = native.profileArtists;
+module.exports.latestDump = native.latestDump;
+module.exports.dumpChecksums = native.dumpChecksums;
 module.exports.version = native.version;
