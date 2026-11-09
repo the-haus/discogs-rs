@@ -26,9 +26,10 @@ discogs-rs reads the [Discogs monthly data dumps](https://data.discogs.com/)
 (CC0) and answers one question fast: for each artist you care about, what
 genres and styles does it release under, by year and by format?
 
-- the file is read in 4 MB chunks and hashed (SHA-256) on the way; given the
-  checksum from Discogs' `CHECKSUM.txt`, a mismatch fails the run and
-  writes nothing;
+- the file, or the HTTPS download, is read in 4 MB chunks and hashed
+  (SHA-256) on the way; given the checksum from Discogs' `CHECKSUM.txt`
+  (or `auto`, looked up there), a mismatch fails the run and writes
+  nothing;
 - gzip is decoded by `flate2` on the `zlib-rs` backend, on its own thread,
   straight into ~16 MB blocks cut after their last whole record;
 - scanner threads take the blocks from a bounded channel and find each
@@ -77,6 +78,44 @@ discogs profile \
 `--kind releases|masters` overrides what the root element says, `--json`
 prints the summary as JSON, `--no-hash` skips the SHA-256 (benchmarks).
 
+### Straight from data.discogs.com
+
+```sh
+discogs latest                      # 20261101: the newest dump whose CHECKSUM.txt is listed
+discogs checksum --dump 20261101    # <sha256>  discogs_20261101_<kind>.xml.gz, per line (--json)
+
+discogs profile \
+  --input 'https://data.discogs.com/?download=data%2F2026%2Fdiscogs_20261101_releases.xml.gz' \
+  --checksum auto \
+  --state discogs-state.json \
+  --keep /data/discogs/discogs_20261101_releases.xml.gz \
+  --targets targets.txt --out releases.parquet
+```
+
+- The download streams into the pass: nothing is stored unless `--keep`
+  (written as it streams to `<keep>.partial`, renamed once the run
+  succeeds, so a second pass can read it locally).
+- `--checksum auto` takes the expected SHA-256 from the dump's
+  `CHECKSUM.txt` (the one beside the URL; for a local file, the one beside
+  it, else the data site's), before anything is downloaded.
+- data.discogs.com ignores `Range`: a dropped connection, a timeout, a 5xx
+  or a 429 starts the file over, `--retries` times (default 2), then the run
+  fails with nothing written. `--timeout` (seconds, default 120) bounds each
+  wait for a connection or the next bytes. Redirects (to the bucket) are
+  followed; the User-Agent is `discogs-rs/<version>`.
+- `--state` is skip-unchanged: each successful run records, per (file,
+  targets), the input's SHA-256 and a hash of the options that shape the
+  output (discogs-rs version, kind, output path). A run whose checksum is
+  known before reading (given or `auto`) and equal, with the same targets
+  and options and its output still there, downloads nothing and reports
+  `skipped: true` (the counts are then the last run's). The "file" is the
+  dump file's kind (`releases`, `masters`), so an unchanged file in a later
+  dump is skipped too. Runs sharing a state file must not overlap.
+- `--base-url` (or `DISCOGS_DATA_URL`) points `latest`, `checksum` and
+  `auto` at another site.
+- TLS is `rustls` with the ring provider and the Mozilla roots compiled in:
+  no OpenSSL, no system CA store needed.
+
 ```sh
 discogs bench --generate 2        # 2 GB synthetic dump, then timed runs
 ```
@@ -96,8 +135,31 @@ const summary = await profileArtists({
 // { kind, records, hits, matched, skippedVarious, skippedMaster, skippedStatus,
 //   skippedQuality, bytes, bytesDecompressed, rows, sha256, decompressor,
 //   threads, seconds, stages: { read, hash, decompress, split, scan, merge, write, total },
-//   mbPerSecond }
+//   mbPerSecond, skipped, source, expectedSha256, downloadSeconds, attempts }
 ```
+
+From the data site, skipping a dump already profiled:
+
+```js
+import { latestDump, dumpChecksums, profileArtists } from "@discogs-rs/node";
+
+const dump = await latestDump();                     // "20261101"
+const sums = await dumpChecksums(dump);              // { "discogs_20261101_releases.xml.gz": "…", … }
+const s = await profileArtists({
+  source: `https://data.discogs.com/?download=data%2F${dump.slice(0, 4)}%2Fdiscogs_${dump}_releases.xml.gz`,
+  checksum: "auto",                  // from the dump's CHECKSUM.txt
+  state: "/data/discogs/state.json", // skip-unchanged
+  keep: `/data/discogs/discogs_${dump}_releases.xml.gz`, // optional copy, written as it streams
+  retries: 2,                        // whole-file retries (default 2)
+  targets,
+  out: "/data/discogs/releases.parquet",
+});
+if (s.skipped) console.log("unchanged since the last run");
+else console.log(`${s.downloadSeconds.toFixed(0)} s on the network, ${s.attempts} attempt(s)`);
+```
+
+`latestDump(options?)` and `dumpChecksums(dump, options?)` take
+`{ baseUrl }` for another site.
 
 The pass runs on its own threads (an napi `AsyncTask`); the JS thread stays
 free. Prebuilt for linux-x64-gnu, linux-arm64-gnu and darwin-arm64.
@@ -112,6 +174,25 @@ let profile = profile_path("discogs_20261101_releases.xml.gz", &targets, &Profil
 write_rows(&profile.rows, "releases.parquet")?;
 println!("{} records, {:.0} MB/s", profile.summary.records, profile.summary.mb_per_s);
 ```
+
+The whole run as the CLI does it (a URL or a path, `auto` checksum, state,
+retries, keep, output):
+
+```rust
+use discogs_core::{run_profile, RunOptions};
+
+let run = run_profile(&targets, &RunOptions {
+    source: "https://data.discogs.com/?download=data%2F2026%2Fdiscogs_20261101_masters.xml.gz".into(),
+    checksum: Some("auto".into()),
+    state: Some("state.json".into()),
+    out: "masters.parquet".into(),
+    ..Default::default()
+})?;
+```
+
+`discogs_core::remote::Http` (feature `http`, on by default) has
+`latest_dump()`, `checksums(dump)` and `open(url)`; `discogs_core::dumps`
+the file names, links and the `CHECKSUM.txt` and listing parsers.
 
 ## What counts
 
@@ -207,6 +288,14 @@ hit.) A 530 MB file of real records (the dump's first records, repeated,
 gzip -6, ratio 6.0) decodes at 990 MB/s. Peak RSS of an end-to-end run:
 141 MB.
 
+Per stage (criterion, `cargo bench -p discogs-core --bench stages`, 32 MB
+of synthetic XML, one thread): the splitter cuts 16 MB blocks at about 12
+GiB/s; `scan_block` runs at 6.6 GiB/s on releases with no hits, 5.5 GiB/s
+at 1% and 4.6 GiB/s at 10%, and 3.6 / 3.2 / 1.9 GiB/s on masters.
+
+From a URL, the network is the ceiling unless the link is faster than
+about 1 GB/s of XML (some 160 MB/s of gzip).
+
 **Decompression is the ceiling.** One scanner thread keeps up with zlib-rs
 with room to spare (the scan costs about 0.2 CPU-seconds per GB), so more
 threads change nothing end to end; they matter only for plain XML input.
@@ -215,8 +304,8 @@ threads change nothing end to end; they matter only for plain XML input.
 
 | path | |
 |---|---|
-| `crates/discogs-core` | the engine: targets, splitter, scanner, format classes, aggregation, pipeline, output, synthetic generator |
-| `crates/discogs-cli` | the `discogs` command: `profile`, `bench` |
+| `crates/discogs-core` | the engine: targets, splitter, scanner, format classes, aggregation, pipeline, output, synthetic generator; `dumps` (names, links, CHECKSUM.txt), `remote` (HTTPS), `run` (checksum lookup, state, retries, keep) |
+| `crates/discogs-cli` | the `discogs` command: `profile`, `checksum`, `latest`, `bench` |
 | `crates/discogs-node` | the napi-rs binding, published as `@discogs-rs/node` |
 | `fixtures/` | hand-written releases and masters, targets, and the first 40 records of the 2026-11-01 dumps |
 | `fuzz/` | cargo-fuzz target for the scanner and splitter |
@@ -225,7 +314,9 @@ threads change nothing end to end; they matter only for plain XML input.
 
 ```sh
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --exclude discogs-node
+cargo test --workspace --exclude discogs-node      # the network tests use a local server
+cargo test -p discogs-core --test http -- --ignored # reads the real data.discogs.com listing (never a dump)
+cargo bench -p discogs-core --bench stages          # criterion: splitter, scan_block
 corepack yarn install && cd crates/discogs-node && corepack yarn build && corepack yarn test
 cargo +nightly fuzz run scan -- -dict=fuzz/discogs.dict   # needs cargo-fuzz; macOS: add --sanitizer none
 ```
@@ -234,8 +325,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Limitations
 
-- Local files only (`.xml.gz` or `.xml`). Reading a URL, `CHECKSUM.txt`
-  and skipping an unchanged dump are next (0.2).
+- No resume: data.discogs.com ignores `Range`, so a broken download starts
+  over (the 10.5 GB releases file included). Use `--keep` to read a dump
+  twice without downloading it twice.
 - One gzip thread: about 1 GB/s of XML on an M1, so the decompressor bounds
   the run. A parallel single-member gunzip is planned only if a real run
   measures below 400 MB/s.
