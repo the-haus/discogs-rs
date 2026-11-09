@@ -9,7 +9,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-discogs-core = { path = "../crates/discogs-core" }
+# The scanner and splitter only: no HTTP client in the fuzz build.
+discogs-core = { path = "../crates/discogs-core", default-features = false }
 
 [[bin]]
 name = "scan"

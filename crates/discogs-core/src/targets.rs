@@ -56,6 +56,17 @@ impl TargetSet {
         self.len == 0
     }
 
+    /// A SHA-256 of the set (lowercase hex): equal sets, equal digests.
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let used = self.words.iter().rposition(|&w| w != 0).map_or(0, |i| i + 1);
+        let mut h = Sha256::new();
+        for w in &self.words[..used] {
+            h.update(w.to_le_bytes());
+        }
+        crate::pipeline::hex(&h.finalize())
+    }
+
     /// Bytes held by the bitset.
     pub fn bytes(&self) -> usize {
         self.words.len() * 8

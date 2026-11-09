@@ -3,13 +3,13 @@
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use discogs_core::generate::{generate, targets_for_hit_rate, GenerateOptions};
-use discogs_core::output::write_rows;
-use discogs_core::{profile_path, ProfileOptions, RecordKind, Summary, TargetSet};
+use discogs_core::remote::{Http, HttpOptions};
+use discogs_core::{profile_path, run_profile, ProfileOptions, RecordKind, RunOptions, Summary, TargetSet};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -26,15 +26,32 @@ struct Cli {
 enum Command {
     /// Per-artist genre and style counts from a releases or masters dump.
     Profile {
-        /// The dump: .xml.gz or .xml.
+        /// The dump: a .xml.gz or .xml path, or an https:// URL (streamed,
+        /// never stored unless --keep).
         #[arg(long)]
-        input: PathBuf,
+        input: String,
         /// Target Discogs artist ids, one per line.
         #[arg(long)]
         targets: PathBuf,
-        /// The input's expected SHA-256; on a mismatch nothing is written.
+        /// The input's expected SHA-256, or `auto`: the sum the dump's
+        /// CHECKSUM.txt gives for the input's file name. On a mismatch
+        /// nothing is written.
         #[arg(long)]
         checksum: Option<String>,
+        /// Skip-unchanged state (JSON): a dump already profiled with the
+        /// same checksum, targets and options is not read again.
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// URL input: also write the download here as it streams (renamed
+        /// into place once the run succeeds).
+        #[arg(long)]
+        keep: Option<PathBuf>,
+        /// URL input: extra whole tries after a dropped connection.
+        #[arg(long, default_value_t = 2)]
+        retries: u32,
+        /// URL input: seconds to wait for a connection or the next bytes.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
         /// Scanner threads (default: cores less one).
         #[arg(long, default_value_t = 0)]
         threads: usize,
@@ -53,6 +70,24 @@ enum Command {
         /// Print the summary as JSON on stdout.
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        site: Site,
+    },
+    /// Print a dump's CHECKSUM.txt: `<sha256>  <file>` per line.
+    Checksum {
+        /// The dump, e.g. 20261101.
+        #[arg(long)]
+        dump: String,
+        /// Print a JSON object (file → sha256) instead.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        site: Site,
+    },
+    /// Print the newest complete dump (the newest whose CHECKSUM.txt is listed).
+    Latest {
+        #[command(flatten)]
+        site: Site,
     },
     /// Generate a synthetic dump and time each stage on it.
     Bench {
@@ -77,44 +112,102 @@ enum Command {
     },
 }
 
+/// Where the dumps are.
+#[derive(clap::Args)]
+struct Site {
+    /// The Discogs data site.
+    #[arg(long, env = "DISCOGS_DATA_URL", default_value = discogs_core::dumps::DISCOGS_DATA)]
+    base_url: String,
+}
+
+impl Site {
+    fn http(&self) -> Result<Http> {
+        Ok(Http::new(HttpOptions {
+            base_url: self.base_url.clone(),
+            ..Default::default()
+        })?)
+    }
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Profile {
             input,
             targets,
             checksum,
+            state,
+            keep,
+            retries,
+            timeout,
             threads,
             kind,
             block_mb,
             out,
             no_hash,
             json,
+            site,
         } => {
             let text = std::fs::read(&targets).with_context(|| format!("{}", targets.display()))?;
             let targets = TargetSet::parse(&text)?;
-            let options = ProfileOptions {
-                threads,
-                block_size: block_mb << 20,
+            let options = RunOptions {
+                source: input,
+                out: out.clone(),
                 checksum,
-                kind,
-                no_hash,
+                state,
+                keep,
+                retries,
+                base_url: Some(site.base_url),
+                timeout: Some(Duration::from_secs(timeout)),
+                profile: ProfileOptions {
+                    threads,
+                    block_size: block_mb << 20,
+                    checksum: None,
+                    kind,
+                    no_hash,
+                },
             };
-            let profile = profile_path(&input, &targets, &options)?;
-            let t = Instant::now();
-            write_rows(&profile.rows, &out)?;
-            let write_s = t.elapsed().as_secs_f64();
+            let run = run_profile(&targets, &options)?;
             if json {
-                let mut v = serde_json::to_value(&profile.summary)?;
-                v["seconds"]["write"] = write_s.into();
+                let mut v = serde_json::to_value(&run)?;
+                v["seconds"]["write"] = run.write_seconds.into();
                 println!("{}", serde_json::to_string_pretty(&v)?);
-            } else {
-                print_summary(&profile.summary, targets.len());
+            } else if run.skipped {
                 eprintln!(
-                    "wrote {} rows to {} in {write_s:.2} s",
-                    profile.rows.len(),
+                    "{}: unchanged since the last run (sha256 {}, same targets and options): skipped; {} stays",
+                    run.source,
+                    run.profile.sha256,
                     out.display()
                 );
+            } else {
+                print_summary(&run.profile, targets.len());
+                if run.download_seconds > 0.0 || run.attempts > 1 {
+                    eprintln!(
+                        "download: {:.2} s waiting on the network, {} attempt(s)",
+                        run.download_seconds, run.attempts
+                    );
+                }
+                eprintln!(
+                    "wrote {} rows to {} in {:.2} s",
+                    run.profile.rows,
+                    out.display(),
+                    run.write_seconds
+                );
             }
+            Ok(())
+        }
+        Command::Checksum { dump, json, site } => {
+            let sums = site.http()?.checksums(&dump)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&sums)?);
+            } else {
+                for (file, sum) in &sums {
+                    println!("{sum}  {file}");
+                }
+            }
+            Ok(())
+        }
+        Command::Latest { site } => {
+            println!("{}", site.http()?.latest_dump()?);
             Ok(())
         }
         Command::Bench {

@@ -25,3 +25,6 @@ serde_json.workspace = true
 anyhow.workspace = true
 flate2.workspace = true
 mimalloc = { workspace = true, optional = true }
+
+[dev-dependencies]
+sha2.workspace = true

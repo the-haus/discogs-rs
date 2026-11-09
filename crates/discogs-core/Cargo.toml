@@ -22,7 +22,20 @@ parquet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+
+[features]
+default = ["http"]
+# HTTPS sources, CHECKSUM.txt and the latest-dump lookup.
+http = ["dep:reqwest", "dep:rustls", "dep:webpki-roots"]
 
 [dev-dependencies]
 proptest.workspace = true
 flate2.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "stages"
+harness = false

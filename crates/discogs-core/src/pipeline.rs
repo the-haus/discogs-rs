@@ -296,7 +296,7 @@ fn read_and_hash<R: Read>(
         let got = match (&mut input).take(CHUNK as u64).read_to_end(&mut chunk) {
             Ok(n) => n,
             Err(e) => {
-                failure.set(Error::Io(e));
+                failure.set(input_error(e));
                 break;
             }
         };
@@ -320,7 +320,20 @@ fn read_and_hash<R: Read>(
     stats
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// A read error of the input: [`Error::Network`] when it came from an
+/// HTTP body (worth a retry), else [`Error::Io`].
+fn input_error(e: io::Error) -> Error {
+    #[cfg(feature = "http")]
+    {
+        crate::remote::classify(e)
+    }
+    #[cfg(not(feature = "http"))]
+    {
+        Error::Io(e)
+    }
+}
+
+pub(crate) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
