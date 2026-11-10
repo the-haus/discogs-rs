@@ -60,7 +60,8 @@ jobs:
             printf '\000' | cat - "$f" > "fuzz/corpus/scan/r-$(basename "$f")"
             printf '\001' | cat - "$f" > "fuzz/corpus/scan/m-$(basename "$f")"
           done
-      - run: cargo fuzz run scan -- -dict=fuzz/discogs.dict -max_total_time=120 -max_len=65536
+      # rust-toolchain.toml pins stable; cargo-fuzz needs nightly (-Zsanitizer).
+      - run: cargo +nightly fuzz run scan -- -dict=fuzz/discogs.dict -max_total_time=120 -max_len=65536
 
   package:
     name: release readiness (versions, crate packaging, workflows)
