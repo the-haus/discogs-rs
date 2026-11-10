@@ -61,7 +61,13 @@ jobs:
             printf '\001' | cat - "$f" > "fuzz/corpus/scan/m-$(basename "$f")"
           done
       # rust-toolchain.toml pins stable; cargo-fuzz needs nightly (-Zsanitizer).
-      - run: cargo +nightly fuzz run scan -- -dict=fuzz/discogs.dict -max_total_time=120 -max_len=65536
+      - run: cargo +nightly fuzz run scan -- -dict=fuzz/discogs.dict -max_total_time=120 -max_len=65536 -timeout=10
+      - if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
 
   package:
     name: release readiness (versions, crate packaging, workflows)
